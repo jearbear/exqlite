@@ -17,6 +17,7 @@ defmodule Exqlite.Sqlite3 do
 
   @type db() :: reference()
   @type statement() :: reference()
+  @type backup() :: reference()
   @type reason() :: atom() | String.t()
   @type row() :: list()
   @type open_mode :: :readwrite | :readonly | :nomutex | :create
@@ -627,6 +628,71 @@ defmodule Exqlite.Sqlite3 do
       rc -> raise Exqlite.Error, message: errmsg(stmt) || errstr(rc)
     end
   end
+
+  @doc """
+  Initialize an online backup from a source database to a destination database.
+
+  Returns an opaque backup handle that can be used with `backup_step/2` and
+  `backup_finish/1`. Both connections must remain open for the lifetime of the
+  backup.
+
+  `dest_name` and `source_name` are the logical database names (for example
+  `"main"`, `"temp"`, or an attached database name); typically `"main"`.
+
+  See: https://www.sqlite.org/c3ref/backup_finish.html
+
+  ## Example
+
+      {:ok, source} = Sqlite3.open("source.db")
+      {:ok, dest} = Sqlite3.open("backup.db")
+      {:ok, backup} = Sqlite3.backup_init(dest, "main", source, "main")
+      :done = backup_all(dest, backup)
+      :ok = Sqlite3.backup_finish(backup)
+
+      defp backup_all(dest, backup) do
+        case Sqlite3.backup_step(backup, -1) do
+          :done -> :done
+          :ok -> backup_all(dest, backup)
+          other -> other
+        end
+      end
+  """
+  @spec backup_init(db(), String.t(), db(), String.t()) ::
+          {:ok, backup()} | {:error, reason()}
+  def backup_init(dest, dest_name, source, source_name) do
+    Sqlite3NIF.backup_init(dest, dest_name, source, source_name)
+  end
+
+  @doc """
+  Copy up to `n_pages` pages between the source and destination databases.
+
+  Pass a negative value to copy all remaining pages in a single step.
+
+  Returns:
+
+    * `:ok` - progress was made and more pages remain to be copied
+    * `:done` - the backup finished copying all pages
+    * `:busy` - the source database is locked (`SQLITE_BUSY`); retry later
+    * `:locked` - a required lock could not be obtained (`SQLITE_LOCKED`)
+    * `{:error, reason}` - the backup failed
+
+  See: https://www.sqlite.org/c3ref/backup_finish.html
+  """
+  @spec backup_step(backup(), integer()) ::
+          :ok | :done | :busy | :locked | {:error, reason()}
+  def backup_step(backup, n_pages), do: Sqlite3NIF.backup_step(backup, n_pages)
+
+  @doc """
+  Release all resources associated with a backup operation.
+
+  This must be called once the backup is complete (or to abort it early). It is
+  safe to call multiple times. Returns `:ok` on success, or `{:error, reason}`
+  if a previous `backup_step/2` encountered an error.
+
+  See: https://www.sqlite.org/c3ref/backup_finish.html
+  """
+  @spec backup_finish(backup()) :: :ok | {:error, reason()}
+  def backup_finish(backup), do: Sqlite3NIF.backup_finish(backup)
 
   defp errmsg(stmt), do: Sqlite3NIF.errmsg(stmt)
   defp errstr(rc), do: Sqlite3NIF.errstr(rc)

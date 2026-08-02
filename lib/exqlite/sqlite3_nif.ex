@@ -15,6 +15,7 @@ defmodule Exqlite.Sqlite3NIF do
 
   @type db() :: reference()
   @type statement() :: reference()
+  @type backup() :: reference()
   @type reason() :: :atom | String.Chars.t()
   @type row() :: list()
 
@@ -116,6 +117,18 @@ defmodule Exqlite.Sqlite3NIF do
 
   @spec errstr(integer) :: String.t()
   def errstr(_rc), do: :erlang.nif_error(:not_loaded)
+
+  @spec backup_init(db(), String.t(), db(), String.t()) ::
+          {:ok, backup()} | {:error, reason()}
+  def backup_init(_dest, _dest_name, _source, _source_name),
+    do: :erlang.nif_error(:not_loaded)
+
+  @spec backup_step(backup(), integer()) ::
+          :ok | :done | :busy | :locked | {:error, reason()}
+  def backup_step(_backup, _n_pages), do: :erlang.nif_error(:not_loaded)
+
+  @spec backup_finish(backup()) :: :ok | {:error, reason()}
+  def backup_finish(_backup), do: :erlang.nif_error(:not_loaded)
 
   # add statement inspection tooling https://sqlite.org/c3ref/expanded_sql.html
 end

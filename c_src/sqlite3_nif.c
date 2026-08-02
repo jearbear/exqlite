@@ -40,9 +40,12 @@ static ERL_NIF_TERM am_delete;
 static ERL_NIF_TERM am_update;
 static ERL_NIF_TERM am_invalid_pid;
 static ERL_NIF_TERM am_log;
+static ERL_NIF_TERM am_invalid_backup;
+static ERL_NIF_TERM am_locked;
 
 static ErlNifResourceType* connection_type       = NULL;
 static ErlNifResourceType* statement_type        = NULL;
+static ErlNifResourceType* backup_type           = NULL;
 static sqlite3_mem_methods default_alloc_methods = {0};
 
 ErlNifPid* log_hook_pid     = NULL;
@@ -74,7 +77,15 @@ typedef struct statement
     sqlite3_stmt* statement;
 } statement_t;
 
+typedef struct backup
+{
+    sqlite3_backup* backup;
+    connection_t* dest;
+    connection_t* source;
+} backup_t;
+
 static int exqlite_progress_handler(void* arg);
+void backup_type_destructor(ErlNifEnv* env, void* arg);
 
 static void*
 exqlite_malloc(int bytes)
@@ -299,6 +310,35 @@ statement_release_lock(statement_t* statement)
 {
     assert(statement);
     connection_release_lock(statement->conn);
+}
+
+// Lock two connections in a stable order (by pointer address) to avoid
+// deadlocking against a concurrent backup running in the opposite direction.
+static inline void
+connection_acquire_lock_pair(connection_t* a, connection_t* b)
+{
+    if (a == b) {
+        connection_acquire_lock(a);
+        return;
+    }
+    if (a < b) {
+        connection_acquire_lock(a);
+        connection_acquire_lock(b);
+    } else {
+        connection_acquire_lock(b);
+        connection_acquire_lock(a);
+    }
+}
+
+static inline void
+connection_release_lock_pair(connection_t* a, connection_t* b)
+{
+    if (a == b) {
+        connection_release_lock(a);
+        return;
+    }
+    connection_release_lock(a);
+    connection_release_lock(b);
 }
 
 static inline void
@@ -1468,6 +1508,8 @@ on_load(ErlNifEnv* env, void** priv, ERL_NIF_TERM info)
     am_update                              = enif_make_atom(env, "update");
     am_invalid_pid                         = enif_make_atom(env, "invalid_pid");
     am_log                                 = enif_make_atom(env, "log");
+    am_invalid_backup                      = enif_make_atom(env, "invalid_backup");
+    am_locked                              = enif_make_atom(env, "locked");
 
     connection_type = enif_open_resource_type(
       env,
@@ -1488,6 +1530,17 @@ on_load(ErlNifEnv* env, void** priv, ERL_NIF_TERM info)
       ERL_NIF_RT_CREATE,
       NULL);
     if (!statement_type) {
+        return -1;
+    }
+
+    backup_type = enif_open_resource_type(
+      env,
+      NULL,
+      "backup_type",
+      backup_type_destructor,
+      ERL_NIF_RT_CREATE,
+      NULL);
+    if (!backup_type) {
         return -1;
     }
 
@@ -2070,6 +2123,242 @@ exqlite_errstr(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 }
 
 //
+// Online Backup API
+//
+// See: https://www.sqlite.org/c3ref/backup_finish.html
+//
+
+///
+/// Initialize a backup operation from a source database to a destination
+/// database. Returns an opaque backup handle to be used with backup_step/2
+/// and backup_finish/1.
+///
+ERL_NIF_TERM
+exqlite_backup_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    assert(env);
+
+    connection_t* dest   = NULL;
+    connection_t* source = NULL;
+    backup_t* backup     = NULL;
+    ErlNifBinary dest_name;
+    ErlNifBinary source_name;
+    ERL_NIF_TERM eos = enif_make_int(env, 0);
+    ERL_NIF_TERM result;
+
+    if (argc != 4) {
+        return enif_make_badarg(env);
+    }
+
+    if (!enif_get_resource(env, argv[0], connection_type, (void**)&dest)) {
+        return make_error_tuple(env, am_invalid_connection);
+    }
+
+    if (!enif_inspect_iolist_as_binary(env, enif_make_list2(env, argv[1], eos), &dest_name)) {
+        return make_error_tuple(env, am_database_name_not_iolist);
+    }
+
+    if (!enif_get_resource(env, argv[2], connection_type, (void**)&source)) {
+        return make_error_tuple(env, am_invalid_connection);
+    }
+
+    if (!enif_inspect_iolist_as_binary(env, enif_make_list2(env, argv[3], eos), &source_name)) {
+        return make_error_tuple(env, am_database_name_not_iolist);
+    }
+
+    backup = enif_alloc_resource(backup_type, sizeof(backup_t));
+    if (!backup) {
+        return make_error_tuple(env, am_out_of_memory);
+    }
+    backup->backup = NULL;
+    backup->dest   = NULL;
+    backup->source = NULL;
+
+    connection_acquire_lock_pair(dest, source);
+
+    if (dest->db == NULL || source->db == NULL) {
+        connection_release_lock_pair(dest, source);
+        enif_release_resource(backup);
+        return make_error_tuple(env, am_connection_closed);
+    }
+
+    backup->backup = sqlite3_backup_init(
+      dest->db,
+      (const char*)dest_name.data,
+      source->db,
+      (const char*)source_name.data);
+
+    if (backup->backup == NULL) {
+        result = make_sqlite3_error_tuple(env, sqlite3_errcode(dest->db), dest->db);
+        connection_release_lock_pair(dest, source);
+        enif_release_resource(backup);
+        return result;
+    }
+
+    // Keep the connections alive for the lifetime of the backup handle.
+    enif_keep_resource(dest);
+    enif_keep_resource(source);
+    backup->dest   = dest;
+    backup->source = source;
+
+    connection_release_lock_pair(dest, source);
+
+    result = enif_make_resource(env, backup);
+    enif_release_resource(backup);
+
+    return make_ok_tuple(env, result);
+}
+
+///
+/// Copy up to `n` pages between the source and destination databases. Pass a
+/// negative value to copy all remaining pages in a single step.
+///
+/// Returns:
+///   :ok    - progress was made, more pages remain
+///   :done  - the backup completed successfully
+///   :busy  - the source database is locked (SQLITE_BUSY)
+///   :locked- a shared lock could not be obtained (SQLITE_LOCKED)
+///
+ERL_NIF_TERM
+exqlite_backup_step(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    assert(env);
+
+    backup_t* backup = NULL;
+    int n_pages;
+    int rc;
+    ERL_NIF_TERM result;
+
+    if (argc != 2) {
+        return enif_make_badarg(env);
+    }
+
+    if (!enif_get_resource(env, argv[0], backup_type, (void**)&backup)) {
+        return make_error_tuple(env, am_invalid_backup);
+    }
+
+    if (!enif_get_int(env, argv[1], &n_pages)) {
+        return enif_make_badarg(env);
+    }
+
+    if (backup->dest == NULL || backup->source == NULL) {
+        return make_error_tuple(env, am_invalid_backup);
+    }
+
+    connection_acquire_lock_pair(backup->dest, backup->source);
+
+    if (backup->backup == NULL) {
+        connection_release_lock_pair(backup->dest, backup->source);
+        return make_error_tuple(env, am_invalid_backup);
+    }
+
+    rc = sqlite3_backup_step(backup->backup, n_pages);
+
+    switch (rc) {
+        case SQLITE_OK:
+            result = am_ok;
+            break;
+        case SQLITE_DONE:
+            result = am_done;
+            break;
+        case SQLITE_BUSY:
+            result = am_busy;
+            break;
+        case SQLITE_LOCKED:
+            result = am_locked;
+            break;
+        default:
+            result = make_sqlite3_error_tuple(env, rc, backup->dest->db);
+            break;
+    }
+
+    connection_release_lock_pair(backup->dest, backup->source);
+
+    return result;
+}
+
+///
+/// Release all resources associated with a backup operation. Safe to call
+/// multiple times. Returns :ok on success or an error tuple if the backup
+/// encountered an error during a previous step.
+///
+ERL_NIF_TERM
+exqlite_backup_finish(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    assert(env);
+
+    backup_t* backup     = NULL;
+    connection_t* dest   = NULL;
+    connection_t* source = NULL;
+    int rc               = SQLITE_OK;
+    ERL_NIF_TERM result  = am_ok;
+
+    if (argc != 1) {
+        return enif_make_badarg(env);
+    }
+
+    if (!enif_get_resource(env, argv[0], backup_type, (void**)&backup)) {
+        return make_error_tuple(env, am_invalid_backup);
+    }
+
+    if (backup->dest == NULL || backup->source == NULL) {
+        // Already finished.
+        return am_ok;
+    }
+
+    dest   = backup->dest;
+    source = backup->source;
+
+    connection_acquire_lock_pair(dest, source);
+
+    if (backup->backup) {
+        rc = sqlite3_backup_finish(backup->backup);
+        backup->backup = NULL;
+        if (rc != SQLITE_OK && dest->db != NULL) {
+            result = make_sqlite3_error_tuple(env, rc, dest->db);
+        }
+    }
+
+    backup->dest   = NULL;
+    backup->source = NULL;
+
+    connection_release_lock_pair(dest, source);
+
+    enif_release_resource(dest);
+    enif_release_resource(source);
+
+    return result;
+}
+
+void
+backup_type_destructor(ErlNifEnv* env, void* arg)
+{
+    assert(env);
+    assert(arg);
+
+    backup_t* backup = (backup_t*)arg;
+
+    if (backup->dest && backup->source) {
+        connection_acquire_lock_pair(backup->dest, backup->source);
+        if (backup->backup) {
+            sqlite3_backup_finish(backup->backup);
+            backup->backup = NULL;
+        }
+        connection_release_lock_pair(backup->dest, backup->source);
+    }
+
+    if (backup->dest) {
+        enif_release_resource(backup->dest);
+        backup->dest = NULL;
+    }
+
+    if (backup->source) {
+        enif_release_resource(backup->source);
+        backup->source = NULL;
+    }
+}
+
+//
 // Most of our nif functions are going to be IO bounded
 //
 
@@ -2105,6 +2394,9 @@ static ErlNifFunc nif_funcs[] = {
   {"cancel", 1, exqlite_cancel, 0},
   {"errmsg", 1, exqlite_errmsg},
   {"errstr", 1, exqlite_errstr},
+  {"backup_init", 4, exqlite_backup_init, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"backup_step", 2, exqlite_backup_step, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"backup_finish", 1, exqlite_backup_finish, ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
 
 ERL_NIF_INIT(Elixir.Exqlite.Sqlite3NIF, nif_funcs, on_load, NULL, on_upgrade, on_unload)
